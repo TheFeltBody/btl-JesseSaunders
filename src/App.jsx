@@ -77,6 +77,7 @@ const fromRow = (row) => ({
   refurb: row.refurb != null ? String(row.refurb) : "",
   purchaseFees: row.purchase_fees != null ? String(row.purchase_fees) : "",
   notes: row.notes || "",
+  mortgageType: row.mortgage_type || "", // "" = inherit global
   status: row.status || "none",
   sort_order: row.sort_order ?? 0,
 });
@@ -92,6 +93,7 @@ const toRow = (p) => ({
   refurb: p.refurb === "" ? null : num(p.refurb),
   purchase_fees: p.purchaseFees === "" ? 0 : num(p.purchaseFees),
   notes: p.notes || null,
+  mortgage_type: p.mortgageType || null, // null = inherit global
   status: p.status || "none",
   sort_order: p.sort_order ?? 0,
   updated_at: new Date().toISOString(),
@@ -122,6 +124,7 @@ const DEFAULTS = {
   depositPct: 0.25,
   rate: 0.055,
   termYears: 25,
+  mortgageType: "repayment", // global default: "repayment" | "interestOnly"
   sdltRate: 0.05,
   legal: 1500,
   survey: 600,
@@ -170,7 +173,13 @@ function analyse(p, a) {
   const capitalRemaining = workingCapital(a) - cashIn;
 
   const annualRent = rent * 12;
-  const mortgageAnnual = monthlyPayment(loan, a.rate, a.termYears) * 12;
+  // Mortgage type: per-property override falls back to the global assumption.
+  const mortgageType = p.mortgageType || a.mortgageType || "repayment";
+  const monthlyMortgage =
+    mortgageType === "interestOnly"
+      ? (loan * a.rate) / 12
+      : monthlyPayment(loan, a.rate, a.termYears);
+  const mortgageAnnual = monthlyMortgage * 12;
   const agentFee = annualRent * a.agentPct;
   const maintenance = annualRent * a.maintPct;
   const voids = annualRent * a.voidsPct;
@@ -192,6 +201,7 @@ function analyse(p, a) {
     isEmpty, offer, asking, rent, refurb, purchaseFees,
     sdlt, acqCosts, totalAcqCost, deposit, loan, cashIn, capitalRemaining,
     annualRent, mortgageAnnual, agentFee, maintenance, voids, erAnnual,
+    mortgageType, mortgageMonthly: monthlyMortgage,
     cashflowSelfAnnual, cashflowSelfPcm, cashflowAgentAnnual, cashflowAgentPcm,
     grossYield, netYield, roi,
     hitsSelf: cashflowSelfPcm >= a.targetSelf,
@@ -214,6 +224,7 @@ const newProp = (over = {}) => ({
   refurb: "",
   purchaseFees: "",
   notes: "",
+  mortgageType: "", // "" = inherit global; else "repayment" | "interestOnly"
   status: "none", // none | favourite | rejected
   sort_order: 0,
   ...over,
@@ -431,7 +442,10 @@ function Ledger({ sb, session }) {
 
   const updateAssumption = (key, value, isPct) =>
     setAssumptions((a) => {
-      const next = { ...a, [key]: isPct ? num(value) / 100 : num(value) };
+      const next = {
+        ...a,
+        [key]: isPct === "raw" ? value : isPct ? num(value) / 100 : num(value),
+      };
       persistAssumptions(next);
       return next;
     });
@@ -734,6 +748,51 @@ function PhotoGallery({ sb, propertyId }) {
   );
 }
 
+/* ---------- per-property mortgage type toggle ---------- */
+function MortgageToggle({ p, a, onChange }) {
+  const globalType = a.mortgageType || "repayment";
+  const override = p.mortgageType || ""; // "" = inherit
+  const effective = override || globalType;
+  const differs = override !== "" && override !== globalType;
+
+  const label = (t) => (t === "interestOnly" ? "Interest-only" : "Repayment");
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div style={S.toggleHead}>
+        <label style={S.label}>Mortgage type</label>
+        {differs && <span style={S.differs} title="Differs from global default">● differs from global</span>}
+      </div>
+      <div style={S.seg}>
+        {["repayment", "interestOnly"].map((t) => {
+          const isOn = effective === t;
+          return (
+            <button
+              key={t}
+              onClick={() => onChange(t)}
+              style={{ ...S.segBtn, ...(isOn ? S.segBtnOn : {}) }}
+            >
+              {label(t)}
+            </button>
+          );
+        })}
+      </div>
+      <div style={S.toggleFoot}>
+        <span style={S.toggleNote}>
+          {override === ""
+            ? `Following global (${label(globalType)})`
+            : `Set for this property`}
+        </span>
+        {override !== "" && (
+          <button style={S.resetLink} onClick={() => onChange("")}>
+            reset to global
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function DetailPage({ sb, p, a, onBack, onChange, onStatus, onRemove }) {
   const r = analyse(p, a);
   const set = (k) => (v) => onChange(p.id, k, v);
@@ -776,7 +835,18 @@ function DetailPage({ sb, p, a, onBack, onChange, onStatus, onRemove }) {
               prefix="£"
               full
             />
-            <Field label="Notes" value={p.notes} onChange={set("notes")} full placeholder="Observations…" />
+          </div>
+
+          <MortgageToggle p={p} a={a} onChange={set("mortgageType")} />
+
+          <div style={{ ...S.field, marginTop: 14 }}>
+            <label style={S.label}>Notes</label>
+            <textarea
+              style={S.notesArea}
+              value={p.notes || ""}
+              placeholder="Observations…"
+              onChange={(e) => set("notes")(e.target.value)}
+            />
           </div>
 
           <PhotoGallery sb={sb} propertyId={p.id} />
@@ -819,7 +889,16 @@ function DetailPage({ sb, p, a, onBack, onChange, onStatus, onRemove }) {
 
           <div style={S.section}>Annual cashflow</div>
           <Line label="Gross rent" value={gbp(r.annualRent)} />
-          <Line label={`Mortgage @ ${pct(a.rate)} / ${a.termYears}yr`} value={"-" + gbp(r.mortgageAnnual)} indent />
+          <Line
+            label={
+              r.mortgageType === "interestOnly"
+                ? `Mortgage — interest-only @ ${pct(a.rate)}`
+                : `Mortgage — repayment @ ${pct(a.rate)} / ${a.termYears}yr`
+            }
+            value={"-" + gbp(r.mortgageAnnual)}
+            indent
+          />
+          <Line label="Mortgage /mo" value={"-" + gbp(r.mortgageMonthly)} indent />
           <Line label="Insurance" value={"-" + gbp(a.insurance)} indent />
           <Line label={`Maintenance @ ${pct(a.maintPct)}`} value={"-" + gbp(r.maintenance)} indent />
           <Line label={`Voids @ ${pct(a.voidsPct)}`} value={"-" + gbp(r.voids)} indent />
@@ -881,22 +960,39 @@ function AssumptionsPanel({ a, onChange }) {
     ["minYield", "Min gross yield", "%", true],
     ["maxBudget", "Max budget", "£", false],
   ];
+  const globalType = a.mortgageType || "repayment";
   return (
-    <div style={S.assumptions}>
-      {rows.map(([key, label, suffix, isPct]) => (
-        <div key={key} style={S.aRow}>
-          <label style={S.aLabel}>{label}</label>
-          <div style={S.inputWrap}>
-            {suffix === "£" && <span style={S.prefix}>£</span>}
-            <input
-              style={{ ...S.input, ...(suffix === "£" ? { paddingLeft: 22 } : {}) }}
-              value={isPct ? +(a[key] * 100).toFixed(2) : a[key]}
-              onChange={(e) => onChange(key, e.target.value, isPct)}
-            />
-            {suffix === "%" && <span style={S.suffix}>%</span>}
-          </div>
+    <div>
+      <div style={S.globalToggleWrap}>
+        <label style={S.aLabel}>Default mortgage type (applies to all properties unless overridden)</label>
+        <div style={{ ...S.seg, maxWidth: 320 }}>
+          {["repayment", "interestOnly"].map((t) => (
+            <button
+              key={t}
+              onClick={() => onChange("mortgageType", t, "raw")}
+              style={{ ...S.segBtn, ...(globalType === t ? S.segBtnOn : {}) }}
+            >
+              {t === "interestOnly" ? "Interest-only" : "Repayment"}
+            </button>
+          ))}
         </div>
-      ))}
+      </div>
+      <div style={S.assumptions}>
+        {rows.map(([key, label, suffix, isPct]) => (
+          <div key={key} style={S.aRow}>
+            <label style={S.aLabel}>{label}</label>
+            <div style={S.inputWrap}>
+              {suffix === "£" && <span style={S.prefix}>£</span>}
+              <input
+                style={{ ...S.input, ...(suffix === "£" ? { paddingLeft: 22 } : {}) }}
+                value={isPct ? +(a[key] * 100).toFixed(2) : a[key]}
+                onChange={(e) => onChange(key, e.target.value, isPct)}
+              />
+              {suffix === "%" && <span style={S.suffix}>%</span>}
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -965,6 +1061,16 @@ const S = {
   prefix: { position: "absolute", left: 9, fontFamily: mono, fontSize: 13, color: C.inkFaint },
   suffix: { position: "absolute", right: 9, fontFamily: mono, fontSize: 13, color: C.inkFaint },
   input: { width: "100%", fontFamily: mono, fontSize: 13.5, padding: "8px 10px", border: `1px solid ${C.ruleStrong}`, borderRadius: 2, background: C.paper, color: C.ink },
+  notesArea: { width: "100%", minHeight: 110, resize: "vertical", fontFamily: sans, fontSize: 13.5, lineHeight: 1.5, padding: "9px 11px", border: `1px solid ${C.ruleStrong}`, borderRadius: 2, background: C.paper, color: C.ink },
+  toggleHead: { display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 },
+  differs: { fontFamily: mono, fontSize: 10, color: C.gold, fontWeight: 600 },
+  seg: { display: "flex", border: `1px solid ${C.ruleStrong}`, borderRadius: 3, overflow: "hidden" },
+  segBtn: { flex: 1, fontFamily: sans, fontSize: 12.5, fontWeight: 500, padding: "9px 10px", background: C.paper, color: C.inkSoft, border: "none", borderRight: `1px solid ${C.rule}` },
+  segBtnOn: { background: C.forest, color: "#fff" },
+  toggleFoot: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6 },
+  toggleNote: { fontSize: 11.5, color: C.inkFaint, fontStyle: "italic" },
+  resetLink: { fontFamily: mono, fontSize: 11, color: C.oxblood, background: "none", border: "none", padding: 0, textDecoration: "underline" },
+  globalToggleWrap: { background: C.card, border: `1px solid ${C.rule}`, borderRadius: 4, padding: 16, marginBottom: 12 },
   listingLink: { display: "inline-block", marginTop: 14, fontSize: 13, color: C.forest, fontWeight: 600, textDecoration: "none" },
   photoGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(88px, 1fr))", gap: 8 },
   thumb: { position: "relative", aspectRatio: "1 / 1", borderRadius: 3, overflow: "hidden", border: `1px solid ${C.rule}` },
